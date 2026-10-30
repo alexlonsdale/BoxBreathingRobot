@@ -4,7 +4,7 @@
 
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
 
-// Application States
+// ---------- Application states ----------
 enum AppState {
   STATE_ANIMATION,
   STATE_MENU,
@@ -13,13 +13,59 @@ enum AppState {
 };
 
 AppState currentMode = STATE_ANIMATION;
+bool needsRedraw = true;
 
-// Button configuration
-const int BUTTON_PIN = 4; // Connect button between GPIO 4 and GND
-unsigned long lastPressTime = 0;
-const unsigned long DEBOUNCE_DELAY = 200; // milliseconds
+// ---------- Menu ----------
+struct MenuItem {
+  const char *label;
+  AppState target;
+};
 
-// Eye layout (pixels)
+MenuItem menuItems[] = {
+  {"Study Timer", STATE_STUDY_TIMER},
+  {"Breathing",   STATE_BREATHING},
+  // add more here
+};
+const int MENU_COUNT   = sizeof(menuItems) / sizeof(menuItems[0]);
+const int MENU_VISIBLE = 5;   // rows that fit under the header
+const int MENU_ROW_H   = 10;
+const int MENU_TOP_Y   = 14;
+
+int menuIndex = 0;   // highlighted item
+int menuTop   = 0;   // first visible item
+
+// ---------- Buttons (each wired between the GPIO and GND) ----------
+const int MENU_PIN   = 4;
+const int UP_PIN     = 14;
+const int DOWN_PIN   = 12;   // strapping pin: don't hold it low while powering up
+const int SELECT_PIN = 13;
+
+const unsigned long DEBOUNCE_DELAY = 30;  // ms, per button
+
+struct Button {
+  uint8_t pin;
+  bool lastLevel;
+  unsigned long lastChange;
+};
+
+Button btnMenu   = {MENU_PIN,   HIGH, 0};
+Button btnUp     = {UP_PIN,     HIGH, 0};
+Button btnDown   = {DOWN_PIN,   HIGH, 0};
+Button btnSelect = {SELECT_PIN, HIGH, 0};
+
+// Returns true once per press (falling edge; INPUT_PULLUP so LOW = pressed)
+bool pressed(Button &b) {
+  bool level = digitalRead(b.pin);
+  unsigned long now = millis();
+  if (level != b.lastLevel && (now - b.lastChange) > DEBOUNCE_DELAY) {
+    b.lastChange = now;
+    b.lastLevel = level;
+    return level == LOW;
+  }
+  return false;
+}
+
+// ---------- Eye layout (pixels) ----------
 const int EYE_W   = 44;
 const int EYE_H   = 34;
 const int EYE_GAP = 16;
@@ -37,8 +83,8 @@ const unsigned long FRAME_MS = 40;    // about 25 fps
 const unsigned long BLINK_MS = 180;   // how long one blink takes
 
 // Animation state variables
-float lookX = 0, lookY = 0;           
-float targetX = 0, targetY = 0;       
+float lookX = 0, lookY = 0;
+float targetX = 0, targetY = 0;
 bool blinking = false;
 unsigned long lastFrame = 0;
 unsigned long blinkStart = 0;
@@ -48,8 +94,8 @@ unsigned long nextGlance;
 // Draws a brow as a row of circles, giving rounded ends
 void drawBrow(int x, int y, bool leftSide) {
   int yL, yR;
-  if (leftSide) { yL = y; yR = y - INNER_LIFT; }        
-  else          { yL = y - INNER_LIFT; yR = y; }        
+  if (leftSide) { yL = y; yR = y - INNER_LIFT; }
+  else          { yL = y - INNER_LIFT; yR = y; }
 
   for (int i = 0; i <= BROW_W; i++) {
     float t = (float)i / BROW_W;
@@ -81,18 +127,6 @@ void drawFace(float lx, float ly, float openness) {
   drawBrow(baseRightX + browCentreOff + browShiftX, browY, false);
 }
 
-void setup() {
-  Wire.begin(21, 22);
-  Wire.setClock(400000);              
-  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
-  randomSeed(esp_random());
-
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-
-  nextBlink  = millis() + 3000;
-  nextGlance = millis() + 5000;
-}
-
 // Eye animation routine
 void eyes() {
   unsigned long now = millis();
@@ -111,12 +145,12 @@ void eyes() {
       blinking = false;
       nextBlink = (random(100) < 15) ? now + 120 : now + random(2500, 6000);
     } else {
-      openness = 1.0 - sin(PI * p);   
+      openness = 1.0 - sin(PI * p);
     }
   }
 
   if (now >= nextGlance) {
-    if (random(100) < 40) {            
+    if (random(100) < 40) {
       targetX = 0; targetY = 0;
     } else {
       targetX = random(-5, 6);
@@ -133,44 +167,172 @@ void eyes() {
   display.display();
 }
 
-void loop() {
-  unsigned long now = millis();
+// ---------- State switching ----------
+void setMode(AppState next) {
+  currentMode = next;
+  needsRedraw = true;
 
-  // Check button press globally with debounce to toggle modes
-  if (digitalRead(BUTTON_PIN) == LOW && (now - lastPressTime) > DEBOUNCE_DELAY) {
-    lastPressTime = now;
-    
-    if (currentMode == STATE_ANIMATION) {
-      currentMode = STATE_MENU;
+  if (next == STATE_ANIMATION) {
+    // Reset timers so eyes pick up smoothly instead of snapping
+    lastFrame  = millis();
+    nextBlink  = millis() + 2000;
+    nextGlance = millis() + 3000;
+  } else if (next == STATE_MENU) {
+    menuIndex = 0;
+    menuTop = 0;
+  }
+}
+
+// ---------- Screens ----------
+void drawMenu() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.print(F("Menu"));
+  display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+
+  for (int row = 0; row < MENU_VISIBLE; row++) {
+    int i = menuTop + row;
+    if (i >= MENU_COUNT) break;
+
+    int y = MENU_TOP_Y + row * MENU_ROW_H;
+    if (i == menuIndex) {
+      // inverted bar for the selected item
+      display.fillRect(0, y - 1, 128, MENU_ROW_H, SSD1306_WHITE);
+      display.setTextColor(SSD1306_BLACK);
     } else {
-      currentMode = STATE_ANIMATION;
-      
-      // Reset timers so eyes pick up smoothly instead of snapping/offsetting
-      lastFrame = millis();
-      nextBlink = millis() + 2000;
-      nextGlance = millis() + 3000;
+      display.setTextColor(SSD1306_WHITE);
     }
+    display.setCursor(4, y);
+    display.print(menuItems[i].label);
+  }
+
+  // tiny scroll hints if there's more off-screen
+  display.setTextColor(SSD1306_WHITE);
+  if (menuTop > 0) {
+    display.setCursor(120, 2);
+    display.print('^');
+  }
+  if (menuTop + MENU_VISIBLE < MENU_COUNT) {
+    display.setCursor(120, 56);
+    display.print('v');
+  }
+
+  display.display();
+}
+
+void drawPlaceholder(const __FlashStringHelper *title) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.print(title);
+  display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+  display.setCursor(0, 18);
+  display.print(F("Coming soon"));
+  display.display();
+}
+
+void menuMove(int dir) {
+  menuIndex = (menuIndex + dir + MENU_COUNT) % MENU_COUNT;  // wraps around
+
+  // keep the highlighted item inside the visible window
+  if (menuIndex < menuTop) menuTop = menuIndex;
+  if (menuIndex >= menuTop + MENU_VISIBLE) menuTop = menuIndex - MENU_VISIBLE + 1;
+  needsRedraw = true;
+}
+
+// ---------- Arduino entry points ----------
+void setup() {
+  Wire.begin(21, 22);
+  Wire.setClock(400000);
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  randomSeed(esp_random());
+
+  pinMode(MENU_PIN,   INPUT_PULLUP);
+  pinMode(UP_PIN,     INPUT_PULLUP);
+  pinMode(DOWN_PIN,   INPUT_PULLUP);
+  pinMode(SELECT_PIN, INPUT_PULLUP);
+
+  nextBlink  = millis() + 3000;
+  nextGlance = millis() + 5000;
+}
+
+void loop() {
+  // Poll every button exactly once per loop
+  bool evMenu   = pressed(btnMenu);
+  bool evUp     = pressed(btnUp);
+  bool evDown   = pressed(btnDown);
+  bool evSelect = pressed(btnSelect);
+
+  // Menu button: anywhere -> menu, except from the menu itself -> eyes
+  if (evMenu) {
+    setMode(currentMode == STATE_MENU ? STATE_ANIMATION : STATE_MENU);
   }
 
   // State dispatcher
   switch (currentMode) {
     case STATE_ANIMATION:
-      eyes();
+      eyes();   // has its own frame limiter
       break;
-      
+
     case STATE_MENU:
-      display.clearDisplay();
-      display.setTextSize(1);
-      display.setTextColor(SSD1306_WHITE);
-      display.setCursor(10, 20);
-      display.print(F("> Menu Mode"));
-      display.display();
+      if (evUp)     menuMove(-1);
+      if (evDown)   menuMove(+1);
+      if (evSelect) setMode(menuItems[menuIndex].target);
+      if (needsRedraw) { drawMenu(); needsRedraw = false; }
       break;
 
     case STATE_STUDY_TIMER:
+      if (needsRedraw) { drawPlaceholder(F("Study Timer")); needsRedraw = false; }
       break;
-      
+
     case STATE_BREATHING:
+      if (needsRedraw) { drawPlaceholder(F("Breathing")); needsRedraw = false; }
       break;
   }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/*
+ * The night has a thousand eyes, and the day but one;
+ * yet the light of the bright world dies with the dying sun.
+ * The mind has a thousand eyes, and the heart but one:
+ * yet the light of a whole life dies when love is done.
+ */
